@@ -1,0 +1,77 @@
+# ENG-134074 test fixture — canonical GitLab CI Kaniko build.
+# Modeled on GitLab's officially documented pattern:
+#   https://docs.gitlab.com/ci/docker/using_kaniko/
+# and Mailu's canonical multi-image build (docs/CI setup).
+#
+# Purpose: exercise the GitLab CI image extractor on a realistic,
+# multi-job Kaniko build. Expected extraction:
+#   - image:  ${CI_REGISTRY_IMAGE}/mailu-admin:${CI_COMMIT_SHORT_SHA}
+#   - image:  ${CI_REGISTRY_IMAGE}/mailu-postfix:${CI_COMMIT_SHORT_SHA}
+#   - image:  ${CI_REGISTRY_IMAGE}/mailu-nginx:${CI_COMMIT_SHORT_SHA}
+#   - image:  ${CI_REGISTRY_IMAGE}/mailu-dovecot:${CI_COMMIT_SHORT_SHA}
+
+stages:
+  - build
+  - publish
+
+variables:
+  KANIKO_VERSION: "v1.23.2-debug"
+  DOCKER_REGISTRY: "$CI_REGISTRY_IMAGE"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+
+# Reusable job template — uses Kaniko to build and push one image per component
+.kaniko_build_template: &kaniko_build
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:${KANIKO_VERSION}
+    entrypoint: [""]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf '%s:%s' \"${CI_REGISTRY_USER}\" \"${CI_REGISTRY_PASSWORD}\" | base64 -w0)\"}}}" > /kaniko/.docker/config.json
+  script:
+    - /kaniko/executor
+      --context "${CI_PROJECT_DIR}/${COMPONENT}"
+      --dockerfile "${CI_PROJECT_DIR}/${COMPONENT}/Dockerfile"
+      --destination "${DOCKER_REGISTRY}/mailu-${COMPONENT}:${IMAGE_TAG}"
+      --destination "${DOCKER_REGISTRY}/mailu-${COMPONENT}:latest"
+      --cache=true
+      --cache-repo "${DOCKER_REGISTRY}/kaniko-cache"
+
+build:admin:
+  <<: *kaniko_build
+  variables:
+    COMPONENT: admin
+
+build:postfix:
+  <<: *kaniko_build
+  variables:
+    COMPONENT: postfix
+
+build:nginx:
+  <<: *kaniko_build
+  variables:
+    COMPONENT: nginx
+
+build:dovecot:
+  <<: *kaniko_build
+  variables:
+    COMPONENT: dovecot
+
+# Also demonstrate a plain docker:dind + docker build/push job for
+# extractor coverage of that pattern.
+publish:manifest:
+  stage: publish
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker login -u "${CI_REGISTRY_USER}" -p "${CI_REGISTRY_PASSWORD}" "${CI_REGISTRY}"
+    - docker build -t "${DOCKER_REGISTRY}/mailu-manifest:${IMAGE_TAG}" -f manifest/Dockerfile manifest/
+    - docker push "${DOCKER_REGISTRY}/mailu-manifest:${IMAGE_TAG}"
+  needs:
+    - build:admin
+    - build:postfix
+    - build:nginx
+    - build:dovecot
